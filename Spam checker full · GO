@@ -1,0 +1,531 @@
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"net"
+	"net/url"
+	"os"
+	"strings"
+)
+
+// ── ANSI Colors ───────────────────────────────────────────────────────────────
+const (
+	reset   = "\033[0m"
+	bold    = "\033[1m"
+	cyan    = "\033[36m"
+	green   = "\033[32m"
+	yellow  = "\033[33m"
+	red     = "\033[31m"
+	magenta = "\033[35m"
+	dim     = "\033[2m"
+	white   = "\033[97m"
+)
+
+// ── Spam Indicators ───────────────────────────────────────────────────────────
+var suspiciousTLDs = map[string]bool{
+	".tk": true, ".ml": true, ".ga": true, ".cf": true,
+	".pw": true, ".xyz": true, ".top": true, ".click": true,
+	".loan": true, ".bid": true, ".win": true, ".gq": true,
+	".cc": true, ".su": true, ".icu": true, ".monster": true,
+	".buzz": true, ".cyou": true,
+}
+
+var brandKeywords = []string{
+	"paypal", "apple", "google", "microsoft", "amazon", "netflix",
+	"bank", "secure", "login", "verify", "update", "account",
+	"confirm", "support", "webscr", "signin", "ebay", "facebook",
+	"instagram", "icloud", "chase", "wellsfargo", "dhl", "fedex",
+	"usps", "prize", "winner", "claim", "reward", "free", "lucky",
+	"congratulations",
+}
+
+var safeDomains = map[string]bool{
+	"google.com": true, "youtube.com": true, "facebook.com": true,
+	"instagram.com": true, "twitter.com": true, "x.com": true,
+	"github.com": true, "microsoft.com": true, "apple.com": true,
+	"amazon.com": true, "wikipedia.org": true, "reddit.com": true,
+	"linkedin.com": true, "netflix.com": true, "stackoverflow.com": true,
+	"cloudflare.com": true, "dropbox.com": true, "paypal.com": true,
+	"ebay.com": true, "zoom.us": true,
+}
+
+var torOctets = map[string]bool{
+	"185": true, "194": true, "193": true, "176": true,
+	"199": true, "198": true, "197": true,
+}
+
+// ── Structs ───────────────────────────────────────────────────────────────────
+type Check struct {
+	Icon   string
+	Name   string
+	Value  string
+	Status string // ok | warn | bad
+}
+
+type Result struct {
+	Target    string
+	Checks    []Check
+	SpamScore int
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+func colorize(text, color string) string {
+	return color + text + reset
+}
+
+func isIP(target string) bool {
+	ip := net.ParseIP(strings.TrimSpace(target))
+	return ip != nil && strings.Contains(target, ".")
+}
+
+func extractDomain(rawURL string) string {
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		rawURL = "http://" + rawURL
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	return u.Hostname()
+}
+
+func getBaseDomain(domain string) string {
+	parts := strings.Split(domain, ".")
+	if len(parts) >= 2 {
+		return parts[len(parts)-2] + "." + parts[len(parts)-1]
+	}
+	return domain
+}
+
+func resolveDNS(domain string) (string, bool) {
+	addrs, err := net.LookupHost(domain)
+	if err != nil || len(addrs) == 0 {
+		return "Cannot resolve", false
+	}
+	return addrs[0], true
+}
+
+func containsAny(s string, keywords []string) bool {
+	for _, k := range keywords {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSuspiciousTLD(domain string) (bool, string) {
+	for tld := range suspiciousTLDs {
+		if strings.HasSuffix(domain, tld) {
+			return true, strings.TrimPrefix(tld, ".")
+		}
+	}
+	return false, ""
+}
+
+func isPrivateIP(ip string) bool {
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return false
+	}
+	privateRanges := []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"}
+	for _, cidr := range privateRanges {
+		_, network, _ := net.ParseCIDR(cidr)
+		if network.Contains(parsedIP) {
+			return true
+		}
+	}
+	return false
+}
+
+// ── Analysis ──────────────────────────────────────────────────────────────────
+func analyzeIP(target string) ([]Check, int) {
+	var checks []Check
+	score := 0
+	parts := strings.Split(target, ".")
+
+	private := isPrivateIP(target)
+	loopback := strings.HasPrefix(target, "127.")
+	torLike := torOctets[parts[0]]
+
+	checks = append(checks, Check{"🌐", "Type", "IPv4 Address", "ok"})
+
+	if private {
+		checks = append(checks, Check{"🏠", "Private IP", "Yes – internal network", "warn"})
+		score += 10
+	} else {
+		checks = append(checks, Check{"🏠", "Private IP", "No – public IP", "ok"})
+	}
+
+	if loopback {
+		checks = append(checks, Check{"🔁", "Loopback", "Yes (127.x.x.x)", "warn"})
+		score += 10
+	} else {
+		checks = append(checks, Check{"🔁", "Loopback", "No", "ok"})
+	}
+
+	if torLike {
+		checks = append(checks, Check{"🧅", "Tor/VPN Range", "⚠️  Possibly anonymous", "bad"})
+		score += 40
+	} else {
+		checks = append(checks, Check{"🧅", "Tor/VPN Range", "Normal range", "ok"})
+	}
+
+	checks = append(checks, Check{"📍", "Geolocation", "Verify at ipinfo.io", "warn"})
+
+	if score > 100 {
+		score = 100
+	}
+	return checks, score
+}
+
+func analyzeURL(target string) ([]Check, int) {
+	var checks []Check
+	score := 0
+	lower := strings.ToLower(target)
+	domain := extractDomain(lower)
+	base := getBaseDomain(domain)
+
+	isHTTPS := strings.HasPrefix(lower, "https://")
+	suspTLD, tldName := hasSuspiciousTLD(domain)
+	ipInURL := net.ParseIP(domain) != nil
+	brandSpoof := containsAny(lower, brandKeywords) && !safeDomains[base]
+	excessDash := strings.Count(domain, "-") > 3
+	parts := strings.Split(domain, ".")
+	numSub := false
+	longSub := false
+	for _, p := range parts[:max(0, len(parts)-2)] {
+		if isAllDigits(p) {
+			numSub = true
+		}
+		if len(p) > 25 {
+			longSub = true
+		}
+	}
+	deepPath := strings.Count(lower, "/") > 6
+	isTrusted := safeDomains[base]
+	urlLenSus := len(target) > 120
+	resolvedIP, resolvedOK := resolveDNS(domain)
+
+	// Protocol
+	if isHTTPS {
+		checks = append(checks, Check{"🔒", "HTTPS", "Secure ✅", "ok"})
+	} else {
+		checks = append(checks, Check{"🔒", "HTTPS", "Insecure ⚠️", "warn"})
+		score += 10
+	}
+
+	checks = append(checks, Check{"🌐", "Domain", domain, "ok"})
+
+	// Trusted
+	if isTrusted {
+		checks = append(checks, Check{"🛡️", "Trusted Domain", "Yes – well-known site ✅", "ok"})
+		score -= 30
+	} else {
+		checks = append(checks, Check{"🛡️", "Trusted Domain", "Not in safe list", "warn"})
+	}
+
+	// TLD
+	if suspTLD {
+		checks = append(checks, Check{"📛", "Suspicious TLD", fmt.Sprintf("Yes (.%s) – often used in spam", tldName), "bad"})
+		score += 35
+	} else {
+		checks = append(checks, Check{"📛", "Suspicious TLD", "Normal TLD", "ok"})
+	}
+
+	// IP in URL
+	if ipInURL {
+		checks = append(checks, Check{"🔢", "IP in URL", "Yes – suspicious!", "bad"})
+		score += 30
+	} else {
+		checks = append(checks, Check{"🔢", "IP in URL", "No", "ok"})
+	}
+
+	// Brand spoofing
+	if brandSpoof {
+		checks = append(checks, Check{"🏷️", "Brand Spoofing", "Detected – fake brand name!", "bad"})
+		score += 35
+	} else {
+		checks = append(checks, Check{"🏷️", "Brand Spoofing", "None found", "ok"})
+	}
+
+	// Long subdomain
+	if longSub {
+		checks = append(checks, Check{"📏", "Long Subdomain", "Suspicious length", "warn"})
+		score += 10
+	} else {
+		checks = append(checks, Check{"📏", "Long Subdomain", "Normal", "ok"})
+	}
+
+	// Excess dashes
+	if excessDash {
+		checks = append(checks, Check{"➖", "Excess Dashes", "Yes – common in spam", "warn"})
+		score += 10
+	} else {
+		checks = append(checks, Check{"➖", "Excess Dashes", "No", "ok"})
+	}
+
+	// Numeric subdomain
+	if numSub {
+		checks = append(checks, Check{"🔢", "Numeric Subdomain", "Yes – suspicious", "warn"})
+		score += 10
+	} else {
+		checks = append(checks, Check{"🔢", "Numeric Subdomain", "No", "ok"})
+	}
+
+	// URL length
+	if urlLenSus {
+		checks = append(checks, Check{"📜", "URL Length", fmt.Sprintf("%d chars – very long", len(target)), "warn"})
+		score += 10
+	} else {
+		checks = append(checks, Check{"📜", "URL Length", fmt.Sprintf("%d chars – normal", len(target)), "ok"})
+	}
+
+	// Deep path
+	if deepPath {
+		checks = append(checks, Check{"🌿", "Deep URL Path", "Yes – possible obfuscation", "warn"})
+		score += 10
+	} else {
+		checks = append(checks, Check{"🌿", "Deep URL Path", "Normal", "ok"})
+	}
+
+	// DNS
+	if resolvedOK {
+		checks = append(checks, Check{"📡", "DNS Resolves", resolvedIP, "ok"})
+	} else {
+		checks = append(checks, Check{"📡", "DNS Resolves", "❌ Cannot resolve – suspicious!", "bad"})
+		score += 20
+	}
+
+	if score < 0 {
+		score = 0
+	}
+	if score > 100 {
+		score = 100
+	}
+	return checks, score
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func isAllDigits(s string) bool {
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
+// ── Display ───────────────────────────────────────────────────────────────────
+func printBanner() {
+	banner := `
+  ██████╗ ██████╗  █████╗ ███╗   ███╗     ██████╗██╗  ██╗███████╗ ██████╗██╗  ██╗███████╗██████╗ 
+  ██╔════╝██╔══██╗██╔══██╗████╗ ████║    ██╔════╝██║  ██║██╔════╝██╔════╝██║ ██╔╝██╔════╝██╔══██╗
+  ╚█████╗ ██████╔╝███████║██╔████╔██║    ██║     ███████║█████╗  ██║     █████╔╝ █████╗  ██████╔╝
+   ╚═══██╗██╔═══╝ ██╔══██║██║╚██╔╝██║    ██║     ██╔══██║██╔══╝  ██║     ██╔═██╗ ██╔══╝  ██╔══██╗
+  ██████╔╝██║     ██║  ██║██║ ╚═╝ ██║    ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗███████╗██║  ██║
+  ╚═════╝ ╚═╝     ╚═╝  ╚═╝╚═╝     ╚═╝     ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝`
+
+	fmt.Println(colorize(banner, cyan))
+	fmt.Println()
+	line := "          🛡️  Spam & Link Checker — Built with Go  🛡️"
+	fmt.Println(colorize(line, bold+white))
+	fmt.Println(colorize("          Anyone can use this! Just paste a link or IP below.", dim))
+	fmt.Println()
+}
+
+func printRule(title string) {
+	width := 80
+	if title == "" {
+		fmt.Println(colorize(strings.Repeat("─", width), dim))
+		return
+	}
+	pad := (width - len(title) - 2) / 2
+	left := strings.Repeat("─", pad)
+	right := strings.Repeat("─", width-pad-len(title)-2)
+	fmt.Println(colorize(left+" "+title+" "+right, cyan))
+}
+
+func verdictInfo(score int) (string, string, string) {
+	switch {
+	case score >= 65:
+		return "🚨  SPAM / DANGEROUS", red, "This link looks dangerous. Do NOT click it."
+	case score >= 35:
+		return "⚠️   SUSPICIOUS", yellow, "Be careful. This link has several red flags."
+	default:
+		return "✅  LOOKS SAFE", green, "No major red flags detected."
+	}
+}
+
+func printBox(lines []string, borderColor, titleColor, title string) {
+	width := 78
+	top := "╭" + strings.Repeat("─", width) + "╮"
+	bot := "╰" + strings.Repeat("─", width) + "╯"
+
+	fmt.Println(colorize(top, borderColor))
+	if title != "" {
+		pad := (width - len(title)) / 2
+		titleLine := "│" + strings.Repeat(" ", pad) + colorize(title, titleColor+bold) + strings.Repeat(" ", width-pad-len(title)) + "│"
+		fmt.Println(colorize("│", borderColor) + strings.Repeat(" ", width) + colorize("│", borderColor))
+		fmt.Println(titleLine)
+	}
+	for _, l := range lines {
+		// Pad line to width (approximate, ignoring ANSI)
+		visible := stripANSI(l)
+		padding := width - 2 - len(visible)
+		if padding < 0 {
+			padding = 0
+		}
+		fmt.Printf("%s  %s%s%s\n", colorize("│", borderColor), l, strings.Repeat(" ", padding), colorize("│", borderColor))
+	}
+	fmt.Println(colorize(colorize("│", borderColor)+strings.Repeat(" ", width)+colorize("│", borderColor), ""))
+	fmt.Println(colorize(bot, borderColor))
+}
+
+func stripANSI(s string) string {
+	// Simple strip for length calculation
+	result := ""
+	inEsc := false
+	for _, c := range s {
+		if c == '\033' {
+			inEsc = true
+		} else if inEsc && c == 'm' {
+			inEsc = false
+		} else if !inEsc {
+			result += string(c)
+		}
+	}
+	return result
+}
+
+func printResult(target string, checks []Check, score int) {
+	label, color, summary := verdictInfo(score)
+
+	// Score bar
+	barFull := score / 5
+	barEmpty := 20 - barFull
+	bar := strings.Repeat("█", barFull) + strings.Repeat("░", barEmpty)
+
+	// Header box
+	shortTarget := target
+	if len(shortTarget) > 60 {
+		shortTarget = shortTarget[:57] + "..."
+	}
+	headerLines := []string{
+		"",
+		colorize(label, bold+color),
+		colorize(summary, white),
+		"",
+		"Spam Risk:  " + colorize(bar, bold+color) + "  " + colorize(fmt.Sprintf("%d%%", score), bold+color),
+		"",
+	}
+	printBox(headerLines, color, color, "Result for: "+shortTarget)
+	fmt.Println()
+
+	// Checks table
+	fmt.Println(colorize("  🔍 Detailed Checks", bold+cyan))
+	fmt.Println()
+
+	// Header row
+	fmt.Printf("  %s%-4s%s  %-22s  %-38s  %s\n",
+		bold+cyan, "    ", reset,
+		colorize("Check", bold+cyan),
+		colorize("Finding", bold+cyan),
+		colorize("Status", bold+cyan),
+	)
+	fmt.Println(colorize("  "+strings.Repeat("─", 76), dim))
+
+	statusMap := map[string]string{
+		"ok":   colorize("● SAFE", green),
+		"warn": colorize("▲ WARN", yellow),
+		"bad":  colorize("✖ RISK", red),
+	}
+	statusColor := map[string]string{
+		"ok": green, "warn": yellow, "bad": red,
+	}
+
+	for _, c := range checks {
+		col := statusColor[c.Status]
+		if col == "" {
+			col = white
+		}
+		val := colorize(c.Value, col)
+		stat := statusMap[c.Status]
+		if stat == "" {
+			stat = colorize("ℹ INFO", cyan)
+		}
+
+		fmt.Printf("  %s  %-22s  %-50s  %s\n",
+			c.Icon,
+			colorize(c.Name, white),
+			val,
+			stat,
+		)
+	}
+
+	fmt.Println(colorize("  "+strings.Repeat("─", 76), dim))
+	fmt.Println()
+
+	// Recommendations
+	if score >= 35 {
+		fmt.Println(colorize("  💡 What to do:", bold+yellow))
+		fmt.Println()
+		if score >= 65 {
+			fmt.Println(colorize("  ► Do NOT click this link! Block the sender immediately.", bold+red))
+		}
+		fmt.Println(colorize("  ► Don't enter passwords or personal info on suspicious links", white))
+		fmt.Println(colorize("  ► Verify at: virustotal.com (free — paste link there)", cyan))
+		fmt.Println(colorize("  ► Forward suspicious emails to your IT/security team", white))
+		fmt.Println()
+	}
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+func main() {
+	printBanner()
+	printRule("Spam & Link Checker")
+	fmt.Println(colorize("  Paste any link, URL, or IP address to check if it's spam.", dim))
+	fmt.Println(colorize("  Type 'exit' to quit. No account or API key needed!\n", dim))
+
+	scanner := bufio.NewScanner(os.Stdin)
+
+	for {
+		fmt.Print(colorize("\n  🔗 Paste link or IP: ", bold+green))
+
+		if !scanner.Scan() {
+			break
+		}
+		target := strings.TrimSpace(scanner.Text())
+
+		if target == "" {
+			fmt.Println(colorize("  Please paste a link or IP address.", dim))
+			continue
+		}
+		if target == "exit" || target == "quit" || target == "q" {
+			fmt.Println(colorize("\n  Stay safe online! 🛡️\n", bold+cyan))
+			break
+		}
+
+		fmt.Println(colorize("\n  Checking...", cyan))
+
+		var checks []Check
+		var score int
+
+		if isIP(target) {
+			checks, score = analyzeIP(target)
+		} else {
+			checks, score = analyzeURL(target)
+		}
+
+		fmt.Println()
+		printResult(target, checks, score)
+		printRule("")
+	}
+}
