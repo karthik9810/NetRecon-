@@ -12,6 +12,7 @@
 ║   ⚠️  ETHICAL USE ONLY — YOUR OWN NETWORK / SYSTEMS ONLY!          ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
+#finnaly any can easliy check your pc 
 
 import subprocess, platform, socket, sys, os, time, re, json
 import datetime, threading, urllib.request, itertools, struct
